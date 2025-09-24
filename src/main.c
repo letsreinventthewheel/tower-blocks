@@ -33,12 +33,20 @@ typedef struct {
 } Movement;
 
 typedef struct {
+    float timer;
+    float delay;
+    float scale;
+    float rotation;
+} Removal;
+
+typedef struct {
     size_t index;
     Vector3 position;
     Vector3 size;
     Color color;
     int colorOffset;
     Movement movement;
+    Removal removal;
 } Block;
 
 typedef struct {
@@ -61,13 +69,20 @@ const Block default_block = (Block) {
         .speed = 0,
         .direction = FORWARD_DIRECTION,
         .axis = X_AXIS
+    },
+    .removal = (Removal) {
+        .delay = 0,
+        .timer = 0,
+        .scale = 1,
+        .rotation = 0
     }
 };
 
 typedef enum {
     READY_STATE,
     PLAYING_STATE,
-    GAME_OVER_STATE
+    GAME_OVER_STATE,
+    RESETTING_STATE
 } GameState;
 
 typedef struct {
@@ -134,13 +149,33 @@ void InitGame(Game *game) {
     game->previous_block = &game->placed_blocks[0];
 }
 
-void DrawBlock(const Block *block, Shader lightingShader) {
-    Vector4 normalizedColor = ColorNormalize(block->color);
-    SetShaderValue(lightingShader, GetShaderLocation(lightingShader, "blockColor"), &(Vector3){normalizedColor.x, normalizedColor.y, normalizedColor.z}, SHADER_UNIFORM_VEC3);
+void ResetGame(Game *game) {
+    size_t len = arrlen(game->falling_blocks);
+    for (int i = len - 1; i >= 0; i--) {
+        FallingBlock *block = &game->falling_blocks[i];
+        if (!block->active) {
+            arrdelswap(game->falling_blocks, i);
+        }
+    }
 
-    BeginShaderMode(lightingShader);
-        DrawCube(block->position, block->size.x, block->size.y, block->size.z, block->color);
-    EndShaderMode();
+    game->state = PLAYING_STATE;
+    game->current_block = default_block;
+    game->current_block.colorOffset = GetRandomValue(0, 100);
+    game->previous_block = &game->placed_blocks[0];
+}
+
+void DrawBlock(Game *game, const Block *block) {
+    Vector4 normalizedColor = ColorNormalize(block->color);
+    SetShaderValue(game->lighting_shader, GetShaderLocation(game->lighting_shader, "blockColor"), &(Vector3){normalizedColor.x, normalizedColor.y, normalizedColor.z}, SHADER_UNIFORM_VEC3);
+
+    Matrix scale = MatrixScale(block->size.x * block->removal.scale, block->size.y, block->size.z * block->removal.scale);
+    Matrix rotate = MatrixRotateXYZ((Vector3) {.x = 0, .y = block->removal.rotation, .z = 0});
+    Matrix translate = MatrixTranslate(block->position.x, block->position.y, block->position.z);
+    Matrix transform = MatrixMultiply(scale, MatrixMultiply(rotate, translate));
+
+    game->cube_model.transform = transform;
+    game->cube_model.materials[0].shader = game->lighting_shader;
+    DrawModel(game->cube_model, (Vector3) {0}, 1.0, block->color);
 }
 
 void DrawPlacedBlocks(Game *game) {
@@ -148,7 +183,7 @@ void DrawPlacedBlocks(Game *game) {
 
     for (size_t i = 0; i < blocks_len; i++) {
         Block *block = &game->placed_blocks[i];
-        DrawBlock(block, game->lighting_shader);
+        DrawBlock(game, block);
     }
 }
 
@@ -183,6 +218,12 @@ Block CreateMovingBlock(Game *game) {
             .speed = 12 + index * 0.5,
             .direction = direction,
             .axis = axis
+        },
+        .removal = (Removal) {
+            .delay = 0,
+            .timer = 0,
+            .scale = 1,
+            .rotation = 0
         }
     };
 }
@@ -273,6 +314,15 @@ bool PlaceBlock(Game *game) {
     return true;
 }
 
+void StartTowerCollapse(Game *game) {
+    size_t len = arrlen(game->placed_blocks);
+    for (size_t i = 1; i < len; i++) {
+        Block *block = &game->placed_blocks[i];
+        // block->removal.active = true;
+        block->removal.delay = (len - i) * 0.05;
+    }
+}
+
 void UpdateGameState(Game *game) {
     bool inputPressed = IsKeyPressed(KEY_SPACE) || IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
 
@@ -302,16 +352,19 @@ void UpdateGameState(Game *game) {
 
         case GAME_OVER_STATE: {
             if (inputPressed) {
-                arrfree(game->placed_blocks);
-                InitGame(game);
-                game->state = PLAYING_STATE;
-                game->current_block = CreateMovingBlock(game);
-
-                game->animations.overlay.type = GAME_OVER_OVERLAY;
+                game->state = RESETTING_STATE;
                 game->animations.overlay.fade = FADING_OUT;
-                game->animations.overlay.alpha = 1;
-                game->animations.overlay.offsetY = 0;
+                StartTowerCollapse(game);
             }
+            break;
+        }
+
+        case RESETTING_STATE: {
+            if (arrlen(game->placed_blocks) == 1) {
+                ResetGame(game);
+                game->current_block = CreateMovingBlock(game);
+            }
+
             break;
         }
     }
@@ -330,7 +383,7 @@ void DrawCurrentBlock(Game *game) {
         return;
     }
 
-    DrawBlock(&game->current_block, game->lighting_shader);
+    DrawBlock(game, &game->current_block);
 }
 
 void DrawOverlay(const Game *game, const char *title, const char *subtitle, size_t titleSize, size_t subtitleSize, int titleY, int subtitleY) {
@@ -475,6 +528,31 @@ void UpdateFallingBlocks(Game *game, float dt) {
     }
 }
 
+void UpdatePlacedBlocks(Game *game, float dt) {
+    if (game->state != RESETTING_STATE) {
+        return;
+    }
+
+    size_t len = arrlen(game->placed_blocks);
+    for (size_t i = len - 1; i > 0; i--) {
+        Block *block = &game->placed_blocks[i];
+
+        block->removal.timer += dt;
+
+        if (block->removal.timer >= block->removal.delay) {
+            float t = (block->removal.timer - block->removal.delay) / 0.2;
+            float scale = 1 - t;
+
+            block->removal.scale = scale;
+            block->removal.rotation = t * 7;
+
+            if (t > 0.9) {
+                arrdelswap(game->placed_blocks, i);
+            }
+        }
+    }
+}
+
 int main(void) {
     InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Tower Blocks");
     SetTargetFPS(60);
@@ -499,6 +577,7 @@ int main(void) {
         UpdateScore(&game, dt);
         UpdateOverlay(&game, dt);
         UpdateFallingBlocks(&game, dt);
+        UpdatePlacedBlocks(&game, dt);
 
         SetShaderValue(game.lighting_shader, GetShaderLocation(game.lighting_shader, "cameraPosition"), &camera.position, SHADER_UNIFORM_VEC3);
 
